@@ -50,6 +50,7 @@ local assert_is_table,
 
 local tflip,
       tstr_cat,
+      tstr,
       tclone,
       tset,
       empty_table
@@ -57,6 +58,7 @@ local tflip,
       {
         'tflip',
         'tstr_cat',
+        'tstr',
         'tclone',
         'tset',
         'empty_table'
@@ -209,17 +211,22 @@ do
       levels_config,
       modules_config,
       flush_type,
-      flush_time
+      flush_time,
+      bufsize
     )
     levels_config = levels_config or empty_table
     modules_config = modules_config or empty_table
     flush_type = flush_type or LOG_FLUSH_MODE.EVERY_N_SECONDS
     flush_time = flush_time or FLUSH_SECONDS_DEFAULT
+    -- Assuming 2048 to be minimal BUFSIZ value that one can encounter
+    -- in the wild these days
+    bufsize = bufsize or 2048 * 0.75
     arguments(
         "table", levels_config,
         "table", modules_config,
         "number", flush_type,
-        "number", flush_time
+        "number", flush_time,
+        "number", bufsize
       )
     return
     {
@@ -228,6 +235,7 @@ do
       last_flush_time = 0;
       flush_type = flush_type;
       flush_time = flush_time;
+      bufsize = bufsize;
       --
       cache_ = make_config_cache(levels_config, modules_config);
     }
@@ -241,24 +249,47 @@ do
   -- Emulating Lua "%q" escape style, as tstr_cat() would use it
   local escape_subst = create_escape_subst("\\%03d")
 
+  local logging_string_prefix_length
+
   -- Private function
   local make_logger
   do
-    local function impl(sink, n, v, ...)
-      if n > 0 then
-        if type(v) ~= "table" then
-          -- We do not dare to log any binary characters
-          -- Note that there is no sense to keep \128-\255 bytes unescaped,
-          -- since we already escape bytes in %c range, and that ruins UTF-8 anyway.
-          sink(tostring(v):gsub("[%c%z\128-\255]", escape_subst))
-        else
-          tstr_cat(sink, v) -- Assuming this does not emit "\n"
-        end
+    local function impl(sink, config, get_time, flush, n, v, ...)
+      config.length = config.length or 0
+      if config.length == 0 then
+        config.length = logging_string_prefix_length or 0
+      end
 
+      if type(v) ~= "table" then
+        -- We do not dare to log any binary characters
+        -- Note that there is no sense to keep \128-\255 bytes unescaped,
+        -- since we already escape bytes in %c range, and that ruins UTF-8 anyway.
+        v = tostring(v):gsub("[%c%z\128-\255]", escape_subst)
+      else
+        v = tstr(v)
+      end
+
+      config.length = config.length + v:len()
+
+      if n > 0 then
+        sink(v)
         if n > 1 then
           sink(" ")
-          return impl(sink, n - 1, ...)
+          return impl(sink, config, get_time, flush, n - 1, ...)
         end
+      end
+      local time = get_time()
+
+      if config.flush_type == LOG_FLUSH_MODE.ALWAYS then
+        flush()
+      elseif
+        config.flush_type == LOG_FLUSH_MODE.EVERY_N_SECONDS and
+        (time > config.last_flush_time + config.flush_time or
+        config.length > config.bufsize)
+      then
+        flush()
+        config.last_flush_time = time
+        config.length = 0
       end
 
       return sink(END_OF_LOG_MESSAGE)
@@ -291,17 +322,15 @@ do
         return function(...)
           if logging_config:is_log_enabled(module_name, level) then
             local time = get_time()
-            sink "[" (date_fn(time)) "] " (logger_id())
-                "[" (suffix) "] "
-            if
-              logging_config.flush_type == LOG_FLUSH_MODE.EVERY_N_SECONDS
-                and time > logging_config.last_flush_time + logging_config.flush_time
-            then
-              flush()
-              logging_config.last_flush_time = time
+            if not logging_string_prefix_length then
+              logging_string_prefix_length =
+                ("[" .. (date_fn(time)) .. "] "
+                .. (logger_id())
+                .. "[" .. (suffix) .. "] "):len()
             end
+            sink "[" (date_fn(time)) "] " (logger_id()) "[" (suffix) "] "
             -- NOTE: Using explicit size since we have to support holes in the vararg.
-            return impl(sink, select("#", ...), ...)
+            return impl(sink, logging_config, get_time, flush, select("#", ...), ...)
           end
         end
       else
@@ -309,17 +338,15 @@ do
         return function(...)
           if logging_config:is_log_enabled(module_name, level) then
             local time = get_time()
-            sink "[" (date_fn(time)) "] " (logger_id)
-                "[" (suffix) "] "
-            if
-              logging_config.flush_type == LOG_FLUSH_MODE.EVERY_N_SECONDS
-                and time > logging_config.last_flush_time + logging_config.flush_time
-            then
-              flush()
-              logging_config.last_flush_time = time
+            if not logging_string_prefix_length then
+              logging_string_prefix_length =
+                ("[" .. (date_fn(time)) .. "] "
+                .. (logger_id)
+                .. "[" .. (suffix) .. "] "):len()
             end
+            sink "[" (date_fn(time)) "] " (logger_id) "[" (suffix) "] "
             -- NOTE: Using explicit size since we have to support holes in the vararg.
-            return impl(sink, select("#", ...), ...)
+            return impl(sink, logging_config, get_time, flush, select("#", ...), ...)
           end
         end
       end
